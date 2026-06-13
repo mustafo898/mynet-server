@@ -172,12 +172,16 @@ async def handle_client(websocket):
             await broadcast({"type": "system", "text": f"🔴 {name} отключился"})
 
 
+async def health_check(connection, request):
+    if request.headers.get("upgrade", "").lower() != "websocket":
+        return connection.respond(200, "MyNet OK\n")
+
 async def main():
     log(f"MyNet Server запущен на порту {PORT}")
     log(f"Папка для файлов: {UPLOAD_DIR.absolute()}")
     log("Ожидание подключений...")
-    async with websockets.serve(handle_client, HOST, PORT):
-        await asyncio.Future()  # работать вечно
+    async with websockets.serve(handle_client, HOST, PORT, process_request=health_check):
+        await asyncio.Future()
 
 
 if __name__ == "__main__":
