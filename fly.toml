@@ -1,0 +1,12 @@
+app = "mynet-server"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[[services]]
+  internal_port = 8765
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 8765
