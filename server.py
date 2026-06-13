@@ -16,7 +16,7 @@ import aiohttp
 # ───────────────────────────────────────────────
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 8765))
-PASSWORD = "your_secret_password_here"  # ← ИЗМЕНИТЕ ЭТО!
+PASSWORD = os.environ.get("PASSWORD", "")  # ← ИЗМЕНИТЕ ЭТО!
 UPLOAD_DIR = Path("uploads")
 # ───────────────────────────────────────────────
 
