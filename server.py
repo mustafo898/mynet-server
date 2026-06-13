@@ -1,188 +1,165 @@
 """
-MyNet Server — запускается на VPS
-Функции: передача файлов, выполнение команд, чат между ПК
+MyNet Server — для Render.com
+HTTP + WebSocket на одном порту
 """
 
 import asyncio
-import websockets
 import json
 import os
 import base64
 import hashlib
 import datetime
 from pathlib import Path
+from aiohttp import web
+import aiohttp
 
 # ───────────────────────────────────────────────
-# НАСТРОЙКИ — измените под себя
-HOST = "0.0.0.0"       # слушать все интерфейсы
-PORT = 8765            # порт (откройте его в файрволе VPS)
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", 8765))
 PASSWORD = "your_secret_password_here"  # ← ИЗМЕНИТЕ ЭТО!
-UPLOAD_DIR = Path("uploads")  # папка для файлов
+UPLOAD_DIR = Path("uploads")
 # ───────────────────────────────────────────────
 
 UPLOAD_DIR.mkdir(exist_ok=True)
-
-# Подключённые клиенты: {websocket: {"name": str, "auth": bool}}
 clients = {}
 
 
 def log(msg: str):
     now = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[{now}] {msg}")
+    print(f"[{now}] {msg}", flush=True)
 
 
 async def broadcast(message: dict, exclude=None):
-    """Отправить сообщение всем авторизованным клиентам"""
     data = json.dumps(message, ensure_ascii=False)
-    for ws, info in clients.items():
+    for ws, info in list(clients.items()):
         if ws != exclude and info.get("auth"):
             try:
-                await ws.send(data)
+                await ws.send_str(data)
             except Exception:
                 pass
 
 
-async def handle_client(websocket):
-    clients[websocket] = {"name": "unknown", "auth": False}
-    addr = websocket.remote_address
+async def handle_ws(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    clients[ws] = {"name": "unknown", "auth": False}
+    addr = request.remote
     log(f"Подключение: {addr}")
 
     try:
-        async for raw in websocket:
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                await websocket.send(json.dumps({"type": "error", "text": "Неверный формат"}))
-                continue
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                try:
+                    data = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    await ws.send_str(json.dumps({"type": "error", "text": "Неверный формат"}))
+                    continue
 
-            mtype = msg.get("type")
+                mtype = data.get("type")
 
-            # ── Авторизация ──────────────────────────────
-            if mtype == "auth":
-                if msg.get("password") == PASSWORD:
-                    name = msg.get("name", f"PC-{addr[0]}")
-                    clients[websocket]["auth"] = True
-                    clients[websocket]["name"] = name
-                    await websocket.send(json.dumps({"type": "auth_ok", "text": f"Добро пожаловать, {name}!"}))
-                    log(f"Авторизован: {name} ({addr[0]})")
-                    await broadcast({"type": "system", "text": f"🟢 {name} подключился"}, exclude=websocket)
-                else:
-                    await websocket.send(json.dumps({"type": "auth_fail", "text": "Неверный пароль"}))
-                    log(f"Неверный пароль от {addr[0]}")
-                continue
-
-            # Все остальные команды — только для авторизованных
-            if not clients[websocket]["auth"]:
-                await websocket.send(json.dumps({"type": "error", "text": "Сначала авторизуйтесь"}))
-                continue
-
-            name = clients[websocket]["name"]
-
-            # ── Список подключённых ПК ───────────────────
-            if mtype == "list":
-                pc_list = [info["name"] for ws, info in clients.items() if info.get("auth")]
-                await websocket.send(json.dumps({"type": "list", "clients": pc_list}))
-
-            # ── Чат сообщение ────────────────────────────
-            elif mtype == "chat":
-                text = msg.get("text", "")
-                to = msg.get("to")  # None = всем
-                log(f"Чат [{name}]: {text}")
-                payload = {"type": "chat", "from": name, "text": text}
-                if to:
-                    # личное сообщение конкретному ПК
-                    for ws, info in clients.items():
-                        if info["name"] == to and info["auth"]:
-                            await ws.send(json.dumps(payload))
-                            break
-                else:
-                    await broadcast(payload, exclude=websocket)
-
-            # ── Отправка файла ────────────────────────────
-            elif mtype == "file_send":
-                filename = os.path.basename(msg.get("filename", "file.bin"))
-                to = msg.get("to")  # имя получателя или None = сохранить на сервере
-                data_b64 = msg.get("data", "")
-                file_bytes = base64.b64decode(data_b64)
-                size_kb = len(file_bytes) / 1024
-
-                if to:
-                    # Переслать другому ПК напрямую
-                    sent = False
-                    for ws, info in clients.items():
-                        if info["name"] == to and info["auth"]:
-                            await ws.send(json.dumps({
-                                "type": "file_receive",
-                                "from": name,
-                                "filename": filename,
-                                "data": data_b64,
-                                "size_kb": round(size_kb, 1)
-                            }))
-                            sent = True
-                            break
-                    if sent:
-                        await websocket.send(json.dumps({"type": "ok", "text": f"Файл '{filename}' отправлен → {to}"}))
-                        log(f"Файл {filename} ({size_kb:.1f} KB): {name} → {to}")
+                if mtype == "auth":
+                    if data.get("password") == PASSWORD:
+                        name = data.get("name", f"PC-{addr}")
+                        clients[ws]["auth"] = True
+                        clients[ws]["name"] = name
+                        await ws.send_str(json.dumps({"type": "auth_ok", "text": f"Добро пожаловать, {name}!"}))
+                        log(f"Авторизован: {name}")
+                        await broadcast({"type": "system", "text": f"🟢 {name} подключился"}, exclude=ws)
                     else:
-                        await websocket.send(json.dumps({"type": "error", "text": f"ПК '{to}' не найден"}))
-                else:
-                    # Сохранить на сервере
-                    save_path = UPLOAD_DIR / filename
-                    save_path.write_bytes(file_bytes)
-                    md5 = hashlib.md5(file_bytes).hexdigest()[:8]
-                    await websocket.send(json.dumps({"type": "ok", "text": f"Файл '{filename}' сохранён на сервере ({size_kb:.1f} KB)"}))
-                    log(f"Файл сохранён: {filename} ({size_kb:.1f} KB) от {name} [md5:{md5}]")
+                        await ws.send_str(json.dumps({"type": "auth_fail", "text": "Неверный пароль"}))
+                    continue
 
-            # ── Список файлов на сервере ──────────────────
-            elif mtype == "file_list":
-                files = []
-                for f in UPLOAD_DIR.iterdir():
-                    if f.is_file():
-                        files.append({"name": f.name, "size_kb": round(f.stat().st_size / 1024, 1)})
-                await websocket.send(json.dumps({"type": "file_list", "files": files}))
+                if not clients[ws]["auth"]:
+                    await ws.send_str(json.dumps({"type": "error", "text": "Сначала авторизуйтесь"}))
+                    continue
 
-            # ── Скачать файл с сервера ────────────────────
-            elif mtype == "file_get":
-                filename = os.path.basename(msg.get("filename", ""))
-                file_path = UPLOAD_DIR / filename
-                if file_path.exists():
-                    data_b64 = base64.b64encode(file_path.read_bytes()).decode()
-                    await websocket.send(json.dumps({
-                        "type": "file_receive",
-                        "from": "server",
-                        "filename": filename,
-                        "data": data_b64,
-                        "size_kb": round(file_path.stat().st_size / 1024, 1)
-                    }))
-                    log(f"Скачан файл: {filename} → {name}")
-                else:
-                    await websocket.send(json.dumps({"type": "error", "text": f"Файл '{filename}' не найден"}))
+                name = clients[ws]["name"]
 
-            else:
-                await websocket.send(json.dumps({"type": "error", "text": f"Неизвестная команда: {mtype}"}))
+                if mtype == "list":
+                    pc_list = [info["name"] for w, info in clients.items() if info.get("auth")]
+                    await ws.send_str(json.dumps({"type": "list", "clients": pc_list}))
 
-    except websockets.exceptions.ConnectionClosed:
-        pass
+                elif mtype == "chat":
+                    text = data.get("text", "")
+                    to = data.get("to")
+                    log(f"Чат [{name}]: {text}")
+                    payload = {"type": "chat", "from": name, "text": text}
+                    if to:
+                        for w, info in clients.items():
+                            if info["name"] == to and info["auth"]:
+                                await w.send_str(json.dumps(payload))
+                                break
+                    else:
+                        await broadcast(payload, exclude=ws)
+
+                elif mtype == "file_send":
+                    filename = os.path.basename(data.get("filename", "file.bin"))
+                    to = data.get("to")
+                    file_bytes = base64.b64decode(data.get("data", ""))
+                    size_kb = len(file_bytes) / 1024
+                    if to:
+                        sent = False
+                        for w, info in clients.items():
+                            if info["name"] == to and info["auth"]:
+                                await w.send_str(json.dumps({
+                                    "type": "file_receive",
+                                    "from": name,
+                                    "filename": filename,
+                                    "data": data.get("data", ""),
+                                    "size_kb": round(size_kb, 1)
+                                }))
+                                sent = True
+                                break
+                        if sent:
+                            await ws.send_str(json.dumps({"type": "ok", "text": f"Файл '{filename}' отправлен → {to}"}))
+                        else:
+                            await ws.send_str(json.dumps({"type": "error", "text": f"ПК '{to}' не найден"}))
+                    else:
+                        (UPLOAD_DIR / filename).write_bytes(file_bytes)
+                        await ws.send_str(json.dumps({"type": "ok", "text": f"Файл '{filename}' сохранён ({size_kb:.1f} KB)"}))
+                        log(f"Файл сохранён: {filename}")
+
+                elif mtype == "file_list":
+                    files = [{"name": f.name, "size_kb": round(f.stat().st_size / 1024, 1)}
+                             for f in UPLOAD_DIR.iterdir() if f.is_file()]
+                    await ws.send_str(json.dumps({"type": "file_list", "files": files}))
+
+                elif mtype == "file_get":
+                    filename = os.path.basename(data.get("filename", ""))
+                    file_path = UPLOAD_DIR / filename
+                    if file_path.exists():
+                        d = base64.b64encode(file_path.read_bytes()).decode()
+                        await ws.send_str(json.dumps({
+                            "type": "file_receive", "from": "server",
+                            "filename": filename, "data": d,
+                            "size_kb": round(file_path.stat().st_size / 1024, 1)
+                        }))
+                    else:
+                        await ws.send_str(json.dumps({"type": "error", "text": f"Файл '{filename}' не найден"}))
+
+            elif msg.type == aiohttp.WSMsgType.ERROR:
+                break
+
     finally:
-        name = clients[websocket]["name"]
-        auth = clients[websocket]["auth"]
-        del clients[websocket]
+        name = clients[ws]["name"]
+        auth = clients[ws]["auth"]
+        del clients[ws]
         if auth:
             log(f"Отключился: {name}")
             await broadcast({"type": "system", "text": f"🔴 {name} отключился"})
 
+    return ws
 
-async def health_check(connection, request):
-    if request.headers.get("upgrade", "").lower() != "websocket":
-        return connection.respond(200, "MyNet OK\n")
 
-async def main():
-    log(f"MyNet Server запущен на порту {PORT}")
-    log(f"Папка для файлов: {UPLOAD_DIR.absolute()}")
-    log("Ожидание подключений...")
-    async with websockets.serve(handle_client, HOST, PORT, process_request=health_check):
-        await asyncio.Future()
+async def handle_http(request):
+    return web.Response(text="MyNet Server is running ✅")
 
+
+app = web.Application()
+app.router.add_get("/", handle_http)
+app.router.add_get("/ws", handle_ws)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    log(f"MyNet Server запущен на порту {PORT}")
+    web.run_app(app, host=HOST, port=PORT)
